@@ -4,31 +4,79 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-import {GoogleGenAI, LiveServerMessage, Modality, Session} from '@google/genai';
 import {LitElement, css, html} from 'lit';
 import {customElement, state} from 'lit/decorators.js';
-import {createBlob, decode, decodeAudioData} from './utils';
 import './visual-3d';
+import { GoogleGenAI } from "@google/genai";
+
+// FIX: Add comprehensive type definitions for Web Speech API to resolve TypeScript errors.
+interface SpeechRecognition extends EventTarget {
+  continuous: boolean;
+  interimResults: boolean;
+  lang: string;
+  start(): void;
+  stop(): void;
+  onresult: (event: SpeechRecognitionEvent) => void;
+  onend: () => void;
+  onerror: (event: SpeechRecognitionErrorEvent) => void;
+}
+
+interface SpeechRecognitionEvent extends Event {
+  resultIndex: number;
+  results: SpeechRecognitionResultList;
+}
+
+interface SpeechRecognitionResultList {
+  [index: number]: SpeechRecognitionResult;
+  length: number;
+  item(index: number): SpeechRecognitionResult;
+}
+
+interface SpeechRecognitionResult {
+  isFinal: boolean;
+  [index: number]: SpeechRecognitionAlternative;
+  length: number;
+  item(index: number): SpeechRecognitionAlternative;
+}
+
+interface SpeechRecognitionAlternative {
+  transcript: string;
+}
+
+interface SpeechRecognitionErrorEvent extends Event {
+  error: string;
+}
+
+// Define SpeechRecognition for browsers that might prefix it.
+declare global {
+  interface Window {
+    SpeechRecognition: new () => SpeechRecognition;
+    webkitSpeechRecognition: new () => SpeechRecognition;
+    webkitAudioContext: typeof AudioContext;
+  }
+}
 
 @customElement('gdm-live-audio')
 export class GdmLiveAudio extends LitElement {
   @state() isRecording = false;
-  @state() status = '';
+  @state() status = 'Click the record button to start talking.';
   @state() error = '';
+  @state() userPrompt = '';
+  @state() llmResponse = '';
 
-  private client: GoogleGenAI;
-  private session: Session;
   private inputAudioContext = new (window.AudioContext ||
     window.webkitAudioContext)({sampleRate: 16000});
   private outputAudioContext = new (window.AudioContext ||
     window.webkitAudioContext)({sampleRate: 24000});
+
   @state() inputNode = this.inputAudioContext.createGain();
   @state() outputNode = this.outputAudioContext.createGain();
-  private nextStartTime = 0;
+
   private mediaStream: MediaStream;
-  private sourceNode: AudioBufferSourceNode;
-  private scriptProcessorNode: ScriptProcessorNode;
-  private sources = new Set<AudioBufferSourceNode>();
+  private sourceNode: MediaStreamAudioSourceNode;
+
+  private recognition: SpeechRecognition;
+  private finalTranscript = '';
 
   static styles = css`
     #status {
@@ -38,6 +86,42 @@ export class GdmLiveAudio extends LitElement {
       right: 0;
       z-index: 10;
       text-align: center;
+      color: white;
+      font-family: sans-serif;
+      padding: 0 10px;
+    }
+
+    .conversation {
+      position: absolute;
+      top: 5vh;
+      left: 5vw;
+      right: 5vw;
+      z-index: 10;
+      display: flex;
+      flex-direction: column;
+      gap: 1em;
+      font-family: sans-serif;
+      color: white;
+      max-height: 40vh;
+      overflow-y: auto;
+    }
+    .conversation > div {
+      padding: 1em;
+      border-radius: 8px;
+      background: rgba(255, 255, 255, 0.1);
+      backdrop-filter: blur(10px);
+    }
+    .conversation .user-prompt {
+      align-self: flex-end;
+      background: rgba(100, 150, 255, 0.2);
+    }
+    .conversation .llm-response {
+      align-self: flex-start;
+    }
+    .conversation strong {
+      display: block;
+      margin-bottom: 0.5em;
+      opacity: 0.7;
     }
 
     .controls {
@@ -64,6 +148,9 @@ export class GdmLiveAudio extends LitElement {
         font-size: 24px;
         padding: 0;
         margin: 0;
+        display: flex;
+        align-items: center;
+        justify-content: center;
 
         &:hover {
           background: rgba(255, 255, 255, 0.2);
@@ -78,98 +165,92 @@ export class GdmLiveAudio extends LitElement {
 
   constructor() {
     super();
-    this.initClient();
-  }
-
-  private initAudio() {
-    this.nextStartTime = this.outputAudioContext.currentTime;
-  }
-
-  private async initClient() {
-    this.initAudio();
-
-    this.client = new GoogleGenAI({
-      apiKey: process.env.GEMINI_API_KEY,
-    });
-
     this.outputNode.connect(this.outputAudioContext.destination);
-
-    this.initSession();
+    this.initSpeechRecognition();
   }
 
-  private async initSession() {
-    const model = 'gemini-2.5-flash-preview-native-audio-dialog';
-
-    try {
-      this.session = await this.client.live.connect({
-        model: model,
-        callbacks: {
-          onopen: () => {
-            this.updateStatus('Opened');
-          },
-          onmessage: async (message: LiveServerMessage) => {
-            const audio =
-              message.serverContent?.modelTurn?.parts[0]?.inlineData;
-
-            if (audio) {
-              this.nextStartTime = Math.max(
-                this.nextStartTime,
-                this.outputAudioContext.currentTime,
-              );
-
-              const audioBuffer = await decodeAudioData(
-                decode(audio.data),
-                this.outputAudioContext,
-                24000,
-                1,
-              );
-              const source = this.outputAudioContext.createBufferSource();
-              source.buffer = audioBuffer;
-              source.connect(this.outputNode);
-              source.addEventListener('ended', () =>{
-                this.sources.delete(source);
-              });
-
-              source.start(this.nextStartTime);
-              this.nextStartTime = this.nextStartTime + audioBuffer.duration;
-              this.sources.add(source);
-            }
-
-            const interrupted = message.serverContent?.interrupted;
-            if(interrupted) {
-              for(const source of this.sources.values()) {
-                source.stop();
-                this.sources.delete(source);
-              }
-              this.nextStartTime = 0;
-            }
-          },
-          onerror: (e: ErrorEvent) => {
-            this.updateError(e.message);
-          },
-          onclose: (e: CloseEvent) => {
-            this.updateStatus('Close:' + e.reason);
-          },
-        },
-        config: {
-          responseModalities: [Modality.AUDIO],
-          speechConfig: {
-            voiceConfig: {prebuiltVoiceConfig: {voiceName: 'Orus'}},
-            // languageCode: 'en-GB'
-          },
-        },
-      });
-    } catch (e) {
-      console.error(e);
+  private initSpeechRecognition() {
+    const SpeechRecognition =
+      window.SpeechRecognition || window.webkitSpeechRecognition;
+    if (!SpeechRecognition) {
+      this.updateError('Speech Recognition API not supported in this browser.');
+      return;
     }
+    this.recognition = new SpeechRecognition();
+    this.recognition.continuous = true;
+    this.recognition.interimResults = true;
+    this.recognition.lang = 'en-US';
+
+    this.recognition.onresult = (event: SpeechRecognitionEvent) => {
+      let interimTranscript = '';
+      this.finalTranscript = '';
+      for (let i = event.resultIndex; i < event.results.length; ++i) {
+        if (event.results[i].isFinal) {
+          this.finalTranscript += event.results[i][0].transcript;
+        } else {
+          interimTranscript += event.results[i][0].transcript;
+        }
+      }
+      this.userPrompt = this.finalTranscript + interimTranscript;
+    };
+
+    this.recognition.onend = () => {
+      if (this.isRecording) {
+        this.stopRecording();
+      }
+    };
+
+    this.recognition.onerror = (event: SpeechRecognitionErrorEvent) => {
+      this.updateError(`Speech recognition error: ${event.error}`);
+    };
   }
 
   private updateStatus(msg: string) {
     this.status = msg;
+    this.error = '';
   }
 
   private updateError(msg: string) {
     this.error = msg;
+    this.status = msg; // Also show error in status for visibility
+  }
+
+  private async getGeminiResponse(prompt: string) {
+    this.updateStatus('Thinking...');
+    this.llmResponse = '';
+    try {
+      // FIX: Use Gemini API instead of Ollama
+      const ai = new GoogleGenAI({apiKey: process.env.API_KEY});
+      const response = await ai.models.generateContent({
+        model: 'gemini-2.5-flash',
+        contents: prompt,
+      });
+
+      const text = response.text;
+      this.llmResponse = text;
+      this.speakResponse(text);
+    } catch (err) {
+      console.error('Error calling Gemini:', err);
+      this.updateError(
+        `Error: Could not connect to Gemini.`,
+      );
+    }
+  }
+
+  private speakResponse(text: string) {
+    if (!('speechSynthesis' in window)) {
+      this.updateError('Speech Synthesis API not supported.');
+      return;
+    }
+    this.updateStatus('Speaking...');
+    const utterance = new SpeechSynthesisUtterance(text);
+    utterance.onend = () => {
+      this.updateStatus('Ready. Click record to speak.');
+    };
+    utterance.onerror = (event) => {
+      this.updateError(`Speech synthesis error: ${event.error}`);
+    };
+    window.speechSynthesis.speak(utterance);
   }
 
   private async startRecording() {
@@ -178,7 +259,6 @@ export class GdmLiveAudio extends LitElement {
     }
 
     this.inputAudioContext.resume();
-
     this.updateStatus('Requesting microphone access...');
 
     try {
@@ -189,77 +269,98 @@ export class GdmLiveAudio extends LitElement {
 
       this.updateStatus('Microphone access granted. Starting capture...');
 
+      // Setup audio graph for visualizer
       this.sourceNode = this.inputAudioContext.createMediaStreamSource(
         this.mediaStream,
       );
       this.sourceNode.connect(this.inputNode);
 
-      const bufferSize = 256;
-      this.scriptProcessorNode = this.inputAudioContext.createScriptProcessor(
-        bufferSize,
-        1,
-        1,
-      );
-
-      this.scriptProcessorNode.onaudioprocess = (audioProcessingEvent) => {
-        if (!this.isRecording) return;
-
-        const inputBuffer = audioProcessingEvent.inputBuffer;
-        const pcmData = inputBuffer.getChannelData(0);
-
-        this.session.sendRealtimeInput({media: createBlob(pcmData)});
-      };
-
-      this.sourceNode.connect(this.scriptProcessorNode);
-      this.scriptProcessorNode.connect(this.inputAudioContext.destination);
-
-      this.isRecording = true;
-      this.updateStatus('🔴 Recording... Capturing PCM chunks.');
+      // Start speech recognition
+      if (this.recognition) {
+        this.finalTranscript = '';
+        this.userPrompt = '';
+        this.llmResponse = '';
+        this.recognition.start();
+        this.isRecording = true;
+        this.updateStatus('🔴 Recording... Speak now.');
+      }
     } catch (err) {
       console.error('Error starting recording:', err);
       this.updateStatus(`Error: ${err.message}`);
-      this.stopRecording();
+      if (this.isRecording) {
+        this.stopRecording();
+      }
     }
   }
 
   private stopRecording() {
-    if (!this.isRecording && !this.mediaStream && !this.inputAudioContext)
-      return;
+    if (!this.isRecording) return;
 
+    if (this.recognition) {
+      this.recognition.stop();
+    }
+    this.isRecording = false;
     this.updateStatus('Stopping recording...');
 
-    this.isRecording = false;
-
-    if (this.scriptProcessorNode && this.sourceNode && this.inputAudioContext) {
-      this.scriptProcessorNode.disconnect();
+    if (this.sourceNode) {
       this.sourceNode.disconnect();
     }
-
-    this.scriptProcessorNode = null;
-    this.sourceNode = null;
 
     if (this.mediaStream) {
       this.mediaStream.getTracks().forEach((track) => track.stop());
       this.mediaStream = null;
     }
 
-    this.updateStatus('Recording stopped. Click Start to begin again.');
+    this.updateStatus('Processing...');
+
+    const trimmedTranscript = this.finalTranscript.trim();
+    if (trimmedTranscript) {
+      this.userPrompt = trimmedTranscript;
+      // FIX: Call getGeminiResponse instead of getOllamaResponse
+      this.getGeminiResponse(trimmedTranscript);
+    } else {
+      this.updateStatus('No speech detected. Click record to try again.');
+    }
   }
 
   private reset() {
-    this.session?.close();
-    this.initSession();
-    this.updateStatus('Session cleared.');
+    if (this.isRecording) {
+      this.stopRecording();
+    }
+    window.speechSynthesis.cancel();
+    this.finalTranscript = '';
+    this.userPrompt = '';
+    this.llmResponse = '';
+    this.updateStatus('Session cleared. Click record to start.');
   }
 
   render() {
     return html`
       <div>
+        <div class="conversation">
+          ${
+            this.userPrompt
+              ? html` <div class="user-prompt">
+                  <strong>You</strong>
+                  ${this.userPrompt}
+                </div>`
+              : ''
+          }
+          ${
+            this.llmResponse
+              ? html` <div class="llm-response">
+                  <strong>AI</strong>
+                  ${this.llmResponse}
+                </div>`
+              : ''
+          }
+        </div>
         <div class="controls">
           <button
             id="resetButton"
             @click=${this.reset}
-            ?disabled=${this.isRecording}>
+            ?disabled=${this.isRecording}
+            title="Reset Session">
             <svg
               xmlns="http://www.w3.org/2000/svg"
               height="40px"
@@ -273,7 +374,8 @@ export class GdmLiveAudio extends LitElement {
           <button
             id="startButton"
             @click=${this.startRecording}
-            ?disabled=${this.isRecording}>
+            ?disabled=${this.isRecording}
+            title="Start Recording">
             <svg
               viewBox="0 0 100 100"
               width="32px"
@@ -286,19 +388,20 @@ export class GdmLiveAudio extends LitElement {
           <button
             id="stopButton"
             @click=${this.stopRecording}
-            ?disabled=${!this.isRecording}>
+            ?disabled=${!this.isRecording}
+            title="Stop Recording">
             <svg
               viewBox="0 0 100 100"
               width="32px"
               height="32px"
-              fill="#000000"
+              fill="#4A4A4A"
               xmlns="http://www.w3.org/2000/svg">
-              <rect x="0" y="0" width="100" height="100" rx="15" />
+              <rect x="15" y="15" width="70" height="70" rx="10" />
             </svg>
           </button>
         </div>
 
-        <div id="status"> ${this.error} </div>
+        <div id="status"> ${this.error ? this.error : this.status} </div>
         <gdm-live-audio-visuals-3d
           .inputNode=${this.inputNode}
           .outputNode=${this.outputNode}></gdm-live-audio-visuals-3d>
